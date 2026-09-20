@@ -44,7 +44,10 @@ def _build_findings_markdown(display_name: str, question: str | None, hits: list
     if question:
         lines += [f"**Question:** {question}", ""]
     if not hits:
-        lines += ["No relevant snippets found for this question.", ""]
+        if question:
+            lines += ["No relevant snippets found for this question.", ""]
+        else:
+            lines += ["Indexed for search, but no question was asked this time.", ""]
     else:
         lines += ["## Relevant snippets", ""]
         for hit in hits:
