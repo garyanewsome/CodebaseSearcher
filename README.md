@@ -18,11 +18,13 @@ Athenaeum's vault sync runs hourly because the vault changes constantly and stay
 
 ## Storage
 
-Chroma, embedded in-process — same pattern as Athenaeum, not a new database service to stand up and operate. One collection per repo (`repo-<name>`), so re-indexing one repo never touches another's data. Everything (repo clones, the Chroma index, the vault's own working clone) lives under `DATA_DIR`, which on the homelab is a PVC backed by `/mnt/storage`, not root — see Hermes's own README for why that distinction actually matters there (root ran to 94% full before it got resized).
+Chroma, embedded in-process — same pattern as Athenaeum, not a new database service to stand up and operate. One collection per repo (`repo-<name>`), so re-indexing one repo never touches another's data. Everything (repo clones, the Chroma index, the vault's own working clone) lives under `DATA_DIR`, which on the homelab is `/mnt/storage/codebase-searcher-data` directly — a plain host path now that this runs bare-metal, not a K8s PVC. Still deliberately not root, which Hermes's own README documents running dangerously low on.
 
 ## Embeddings
 
-`jinaai/jina-embeddings-v2-base-code` via `sentence-transformers` (`trust_remote_code=True` — it's a Jina-custom architecture, not vanilla BERT), CPU only, `batch_size=8`. This never runs on the interactive chat path — it's a batch job triggered by an explicit "check out this repo" ask — so there's no reason to contend with Ollama/Iris for the homelab's one shared GPU, and no VRAM handoff dance to replicate. Verified locally: code-to-matching-description similarity ~0.71, code-to-unrelated ~0.17 — real semantic separation, not just keyword overlap.
+`jinaai/jina-embeddings-v2-base-code` via `sentence-transformers` (`trust_remote_code=True` — it's a Jina-custom architecture, not vanilla BERT), `batch_size=8`, GPU-accelerated (`device` auto-detects `cuda`, falling back to `cpu` for local dev on a Mac). Verified locally: code-to-matching-description similarity ~0.71, code-to-unrelated ~0.17 — real semantic separation, not just keyword overlap.
+
+**GPU handoff.** A real CPU-only run took 552.7s to embed a mid-size repo (see Status) — too slow for a synchronous tool call, and it pegged the same CPU Ollama's chat model runs on. This now runs bare-metal on the homelab host and shares the RTX 3060 with Ollama/Iris, using the identical handoff pattern already proven for `generate_image`: Hermes unloads Ollama's model (`keep_alive: 0`) right before calling `/research`, and calls this service's own `POST /unload` right after — which drops the cached `SentenceTransformer` and calls `torch.cuda.empty_cache()` — so the GPU is free again before Ollama reloads for the follow-up reply. See `app/embeddings.py` (`unload_model`) and Hermes's `app/chat.py` (`_unload_codebase_searcher`).
 
 Swap the model via `EMBEDDING_MODEL` if needed; `app/embeddings.py` is a thin, swappable wrapper, same shape as `skunkworks_ai_rag`'s.
 
@@ -47,51 +49,75 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 DATA_DIR=./data GITHUB_SSH_KEY_PATH=~/.ssh/id_ed25519 .venv/bin/uvicorn app.main:app --reload --port 8002
 ```
 
-Point `GITHUB_SSH_KEY_PATH` at whatever key your own machine already uses for GitHub — locally there's no need for the homelab's dedicated key.
+Point `GITHUB_SSH_KEY_PATH` at whatever key your own machine already uses for GitHub — locally there's no need for the homelab's dedicated key. On a Mac (no CUDA) this falls back to CPU automatically — fine for quick local checks, just slow on anything but a handful of chunks.
 
 ## Deployment
 
-Runs in K3s, internal-only — no NodePort or Ingress, since nothing outside the cluster ever talks to this directly, only Hermes does.
-
-- `k8s/codebase-searcher-api.yaml` — Deployment + Service + PersistentVolume/Claim (backed by `/mnt/storage/codebase-searcher-data`)
-
-**One-time setup before the first deploy** (needs `kubectl`, homelab's own terminal only):
+Bare-metal on the homelab host, not K3s — same reason as Iris: embedding needs the GPU, and the cluster has no device plugin configured for it. Reachable on the LAN by IP:port (`http://192.168.1.157:8300`), no Ingress/hostname.
 
 ```bash
-# Account-level key already on the homelab host — reused as-is, read-only
-# in the sense that it only ever clones/pulls research targets, never
-# pushes anywhere.
-kubectl create secret generic github-ssh-key \
-  --from-file=id_ed25519_github=$HOME/.ssh/id_ed25519_github
-
-# Dedicated write-scoped deploy key for the vault — generated specifically
-# for this service; the public half needs adding as a deploy key on the
-# obsidian-vault GitHub repo with "Allow write access" checked.
-kubectl create secret generic vault-write-key \
-  --from-file=vault_write=$HOME/.ssh/codebase-searcher/vault_write
-
-kubectl apply -f k8s/codebase-searcher-api.yaml
+sudo systemctl status codebase-searcher
+sudo systemctl restart codebase-searcher
 ```
 
-To redeploy after a code change: `./deploy.sh`.
+To redeploy after a code change: `./deploy.sh` — pulls, reinstalls dependencies, restarts the service.
+
+**One-time setup** (homelab's own terminal):
+
+```bash
+git clone git@github.com:garyanewsome/CodebaseSearcher.git ~/CodebaseSearcher
+cd ~/CodebaseSearcher
+
+python3.12 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -r requirements.txt
+
+mkdir -p /mnt/storage/codebase-searcher-data
+```
+
+The two GitHub keys just need to already exist at the paths `app/config.py` expects (see there) — the account-level key (`~/.ssh/id_ed25519_github`) almost certainly already does; the vault write-scoped key needs generating once if it doesn't exist yet:
+
+```bash
+mkdir -p ~/.ssh/codebase-searcher
+ssh-keygen -t ed25519 -f ~/.ssh/codebase-searcher/vault_write -N ""
+# add the .pub half as a deploy key on the obsidian-vault repo, with
+# "Allow write access" checked
+```
+
+Then create the systemd unit (`/etc/systemd/system/codebase-searcher.service`), matching Iris's shape:
+
+```ini
+[Unit]
+Description=CodebaseSearcher service
+After=network-online.target
+
+[Service]
+User=garyanewsome
+WorkingDirectory=/home/garyanewsome/CodebaseSearcher
+ExecStart=/home/garyanewsome/CodebaseSearcher/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8300
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now codebase-searcher
+```
+
+If this was previously deployed to K3s (an earlier iteration was), the two K8s secrets (`github-ssh-key`, `vault-write-key`) and anything from `kubectl apply` are no longer used and can be deleted with `kubectl delete secret github-ssh-key vault-write-key` — harmless to leave them too, just dead weight.
 
 ## Hermes integration
 
-Two tools in Hermes's `app/tools.py`: `research_repo(repo, question)` and `forget_repo(repo)`, calling this service's `/research` and `/forget`. `CODEBASE_SEARCHER_URL` in Hermes's `app/config.py` points at it over in-cluster service DNS.
+Two tools in Hermes's `app/tools.py`: `research_repo(repo, question)` and `forget_repo(repo)`, calling this service's `/research` and `/forget`. `CODEBASE_SEARCHER_URL` in Hermes's `app/config.py` points at it by LAN IP:port (`http://192.168.1.157:8300`), same as `IRIS_URL`. `research_repo` gets the same GPU handoff as `generate_image` in Hermes's `app/chat.py` — see the GPU handoff note above.
 
 ## Status
 
 - [x] Chunking, embedding, indexing, semantic search — verified against a real test repo, including that a discount-pricing question correctly ranked the pricing function far above an unrelated greeting function
 - [x] Vault write-back — verified end to end against a throwaway fake vault, including the push-retry path and same-day dedup naming
-- [x] OOM fix verified on the real homelab hardware (Ryzen 5 5600G, CPU-only): encoding dragonfly-reverb's 284 chunks took 552.7s and held around 1.7GB RSS — no OOM kill (previously crashed at 12.3GB). Still slow enough on CPU that a real GPU-vs-CPU decision is needed before this goes live; see below.
-- [ ] Not yet deployed to K3s — needs the two deploy-key secrets created first (see Deployment)
-- [ ] Not yet wired into Hermes's actual running deployment (tool functions added; needs Hermes redeployed with `CODEBASE_SEARCHER_URL` pointed at this service)
-
-## CPU vs. GPU
-
-First-time indexing a mid-size repo takes ~9 minutes on the homelab's CPU (confirmed above) — no crash, but that's a bad synchronous wait inside a chat turn, and it exceeds Hermes's 300s tool-call timeout as-is. Two ways to fix that:
-
-- **Bump the timeout and lean on the commit-based cache.** `/research` only re-embeds when the repo's HEAD commit changed since last time, so the ~9 minute cost only hits the *first* question about a given commit — every follow-up question is search-only (seconds). Simplest change (raise `research_repo`'s timeout in Hermes's `app/tools.py`), no new infrastructure, stays in K3s. Downside: that first ask is still a multi-minute wait, and it's pegging CPU on the same box Ollama's chat model runs on for the whole time.
-- **Move embedding to the GPU**, replicating the VRAM handoff already used for `generate_image` (unload Ollama's model, run the embedding pass on the RTX 3060, unload it after). Given how small the Jina model is, this would very likely drop indexing to single-digit seconds — but it means running this service bare-metal instead of in K3s (no GPU device plugin configured), plus the handoff's own overhead on every call.
-
-Recommendation: go GPU. This is explicitly a "lone task" — same category as image generation, which already earned the bare-metal-plus-handoff treatment for exactly this reason. A 9-minute CPU wall clock (even cached per-commit) is a worse experience than the handoff overhead, and it stops this job from competing with Ollama's chat inference for CPU on the same box mid-request.
+- [x] Chunk-size OOM fix verified on the real homelab hardware: encoding dragonfly-reverb's 284 chunks held around 1.7GB RSS on CPU — no OOM kill (previously crashed at 12.3GB)
+- [x] Moved to bare-metal/GPU after that same CPU run measured 552.7s (~9 min) for 284 chunks — too slow for a synchronous tool call. GPU handoff code written (`unload_model`/`/unload`, mirroring Iris); **not yet re-benchmarked on the actual RTX 3060** — do that once deployed, before considering this fully verified
+- [ ] Not yet deployed — needs the one-time systemd setup above run on the homelab
+- [ ] Not yet wired into Hermes's actual running deployment (tool + handoff code written and pushed; needs Hermes redeployed to pick it up)

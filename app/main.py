@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from app import repo_manager, vault_writer, vector_store
+from app import embeddings, repo_manager, vault_writer, vector_store
 from app.chunking import chunk_repo
 
 logger = logging.getLogger("codebase-searcher")
@@ -22,6 +22,14 @@ class ForgetRequest(BaseModel):
 
 @app.get("/health")
 def health():
+    return {"status": "ok"}
+
+
+@app.post("/unload")
+def unload():
+    # Hermes calls this right after /research returns, same handoff shape
+    # as Iris's own /unload — frees the GPU for Ollama's next chat turn.
+    embeddings.unload_model()
     return {"status": "ok"}
 
 
