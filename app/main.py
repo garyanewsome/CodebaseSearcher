@@ -25,8 +25,14 @@ def health():
     return {"status": "ok"}
 
 
-def _build_findings_markdown(repo: str, question: str | None, hits: list[dict]) -> str:
-    lines = [f"# Codebase findings: {repo}", ""]
+def _display_name(cache_key: str) -> str:
+    # "owner__name" for a third-party repo -> just "name" for note titles;
+    # the user's own repos are already a bare name as their cache_key.
+    return cache_key.split("__", 1)[1] if "__" in cache_key else cache_key
+
+
+def _build_findings_markdown(display_name: str, question: str | None, hits: list[dict]) -> str:
+    lines = [f"# Codebase findings: {display_name}", ""]
     if question:
         lines += [f"**Question:** {question}", ""]
     if not hits:
@@ -45,35 +51,36 @@ def research(request: ResearchRequest):
         raise HTTPException(status_code=400, detail="repo is required")
 
     try:
-        path, commit = repo_manager.clone_or_pull(repo)
+        path, commit, cache_key = repo_manager.clone_or_pull(repo)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to clone/pull '{repo}': {exc}")
 
-    if repo_manager.get_indexed_commit(repo) != commit:
+    if repo_manager.get_indexed_commit(cache_key) != commit:
         chunks = chunk_repo(path)
-        count = vector_store.replace_repo_index(repo, chunks)
-        repo_manager.set_indexed_commit(repo, commit)
-        logger.info("Re-indexed %s at %s: %d chunks", repo, commit[:8], count)
+        count = vector_store.replace_repo_index(cache_key, chunks)
+        repo_manager.set_indexed_commit(cache_key, commit)
+        logger.info("Re-indexed %s at %s: %d chunks", cache_key, commit[:8], count)
 
-    hits = vector_store.search_repo(repo, request.question, top_k=8) if request.question else []
-    markdown = _build_findings_markdown(repo, request.question, hits)
+    hits = vector_store.search_repo(cache_key, request.question, top_k=8) if request.question else []
+    display_name = _display_name(cache_key)
+    markdown = _build_findings_markdown(display_name, request.question, hits)
 
     try:
-        note_path = vault_writer.write_finding(repo, request.question, markdown)
+        note_path = vault_writer.write_finding(display_name, request.question, markdown)
     except Exception as exc:
         # The search itself succeeded even if the vault write failed —
         # still worth returning the snippets rather than a bare 500 for a
         # problem in an unrelated system (git push, deploy key, ...).
-        logger.exception("Failed to write findings note for %s", repo)
+        logger.exception("Failed to write findings note for %s", cache_key)
         return {
-            "repo": repo,
+            "repo": display_name,
             "commit": commit,
             "hits": hits,
             "note_path": None,
             "note_error": str(exc),
         }
 
-    return {"repo": repo, "commit": commit, "hits": hits, "note_path": note_path}
+    return {"repo": display_name, "commit": commit, "hits": hits, "note_path": note_path}
 
 
 @app.post("/forget")
@@ -81,6 +88,6 @@ def forget(request: ForgetRequest):
     repo = request.repo.strip()
     if not repo:
         raise HTTPException(status_code=400, detail="repo is required")
-    repo_manager.delete_repo(repo)
-    vector_store.delete_repo_index(repo)
+    cache_key = repo_manager.delete_repo(repo)
+    vector_store.delete_repo_index(cache_key)
     return {"status": "ok"}
