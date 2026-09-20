@@ -22,13 +22,15 @@ Chroma, embedded in-process — same pattern as Athenaeum, not a new database se
 
 ## Embeddings
 
-`jinaai/jina-embeddings-v2-base-code` via `sentence-transformers` (`trust_remote_code=True` — it's a Jina-custom architecture, not vanilla BERT), CPU only. This never runs on the interactive chat path — it's a batch job triggered by an explicit "check out this repo" ask — so there's no reason to contend with Ollama/Iris for the homelab's one shared GPU, and no VRAM handoff dance to replicate. Verified locally: code-to-matching-description similarity ~0.71, code-to-unrelated ~0.17 — real semantic separation, not just keyword overlap.
+`jinaai/jina-embeddings-v2-base-code` via `sentence-transformers` (`trust_remote_code=True` — it's a Jina-custom architecture, not vanilla BERT), CPU only, `batch_size=8`. This never runs on the interactive chat path — it's a batch job triggered by an explicit "check out this repo" ask — so there's no reason to contend with Ollama/Iris for the homelab's one shared GPU, and no VRAM handoff dance to replicate. Verified locally: code-to-matching-description similarity ~0.71, code-to-unrelated ~0.17 — real semantic separation, not just keyword overlap.
 
 Swap the model via `EMBEDDING_MODEL` if needed; `app/embeddings.py` is a thin, swappable wrapper, same shape as `skunkworks_ai_rag`'s.
 
 ## Chunking
 
 Line-based with blank-line-aware boundaries (`app/chunking.py`) — not AST/tree-sitter parsing. Same pragmatic bar as Athenaeum's own markdown chunker, which its own README is upfront about being "functional, not tuned." Good enough to find the right file and the right neighborhood of it. Revisit with real per-language parsing if retrieval quality turns out to actually suffer in practice — not before.
+
+A hard 6500-char ceiling (`CHUNK_HARD_MAX_CHARS`) caps every chunk regardless of blank-line availability. Found the hard way: a real repo (dragonfly-reverb) had a dense C++ header with no blank-line break for ~9000 chars, and `sentence_transformers.encode()` pads every sequence in a batch to that batch's longest member before the forward pass — so one such outlier blows up attention memory for its *entire* batch (`batch_size × max_len²`), not just itself. That OOM-killed the process on the homelab's 14GB box. The hard cap plus the reduced batch size above fixed it.
 
 ## Writing to the vault
 
@@ -81,5 +83,15 @@ Two tools in Hermes's `app/tools.py`: `research_repo(repo, question)` and `forge
 
 - [x] Chunking, embedding, indexing, semantic search — verified against a real test repo, including that a discount-pricing question correctly ranked the pricing function far above an unrelated greeting function
 - [x] Vault write-back — verified end to end against a throwaway fake vault, including the push-retry path and same-day dedup naming
+- [x] OOM fix verified on the real homelab hardware (Ryzen 5 5600G, CPU-only): encoding dragonfly-reverb's 284 chunks took 552.7s and held around 1.7GB RSS — no OOM kill (previously crashed at 12.3GB). Still slow enough on CPU that a real GPU-vs-CPU decision is needed before this goes live; see below.
 - [ ] Not yet deployed to K3s — needs the two deploy-key secrets created first (see Deployment)
 - [ ] Not yet wired into Hermes's actual running deployment (tool functions added; needs Hermes redeployed with `CODEBASE_SEARCHER_URL` pointed at this service)
+
+## CPU vs. GPU
+
+First-time indexing a mid-size repo takes ~9 minutes on the homelab's CPU (confirmed above) — no crash, but that's a bad synchronous wait inside a chat turn, and it exceeds Hermes's 300s tool-call timeout as-is. Two ways to fix that:
+
+- **Bump the timeout and lean on the commit-based cache.** `/research` only re-embeds when the repo's HEAD commit changed since last time, so the ~9 minute cost only hits the *first* question about a given commit — every follow-up question is search-only (seconds). Simplest change (raise `research_repo`'s timeout in Hermes's `app/tools.py`), no new infrastructure, stays in K3s. Downside: that first ask is still a multi-minute wait, and it's pegging CPU on the same box Ollama's chat model runs on for the whole time.
+- **Move embedding to the GPU**, replicating the VRAM handoff already used for `generate_image` (unload Ollama's model, run the embedding pass on the RTX 3060, unload it after). Given how small the Jina model is, this would very likely drop indexing to single-digit seconds — but it means running this service bare-metal instead of in K3s (no GPU device plugin configured), plus the handoff's own overhead on every call.
+
+Recommendation: go GPU. This is explicitly a "lone task" — same category as image generation, which already earned the bare-metal-plus-handoff treatment for exactly this reason. A 9-minute CPU wall clock (even cached per-commit) is a worse experience than the handoff overhead, and it stops this job from competing with Ollama's chat inference for CPU on the same box mid-request.
