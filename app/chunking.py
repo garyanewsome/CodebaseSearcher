@@ -15,6 +15,15 @@ from typing import Iterator
 
 CHUNK_MAX_LINES = 120
 CHUNK_MAX_CHARS = 6000
+# A hard ceiling, no leniency: without this, a file with a long stretch of
+# non-blank lines (a dense function body, generated code, ...) can grow a
+# single chunk unboundedly, since the soft cap above only flushes on a
+# blank line. Confirmed live on a real repo (dragonfly-reverb) — outlier
+# chunks up to ~9000 chars caused the embedding batch containing them to
+# OOM-kill the whole process (batching pads every sequence in a batch to
+# its longest member, so attention memory scales with batch_size times
+# that outlier's length squared, not the batch's typical length).
+CHUNK_HARD_MAX_CHARS = 6500
 
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".h",
@@ -57,8 +66,9 @@ def _chunk_lines(lines: list[str]) -> list[str]:
     for line in lines:
         buf.append(line)
         buf_chars += len(line) + 1
-        over_size = len(buf) >= CHUNK_MAX_LINES or buf_chars >= CHUNK_MAX_CHARS
-        if over_size and line.strip() == "":
+        over_soft = len(buf) >= CHUNK_MAX_LINES or buf_chars >= CHUNK_MAX_CHARS
+        over_hard = buf_chars >= CHUNK_HARD_MAX_CHARS
+        if over_hard or (over_soft and line.strip() == ""):
             flush()
             buf, buf_chars = [], 0
     flush()

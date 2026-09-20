@@ -23,7 +23,7 @@ def embedding_dim() -> int:
     return int(_model().get_sentence_embedding_dimension())
 
 
-def encode_texts(texts: Sequence[str], batch_size: int = 16) -> np.ndarray:
+def encode_texts(texts: Sequence[str], batch_size: int = 8) -> np.ndarray:
     if not texts:
         return np.zeros((0, embedding_dim()), dtype=np.float32)
     model = _model()
