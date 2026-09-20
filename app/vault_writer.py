@@ -1,4 +1,4 @@
-"""Writes findings notes into the Obsidian vault via its own git clone —
+"""Writes notes into the Obsidian vault via its own git clone —
 deliberately separate from Athenaeum's read-only vault clone (see this
 project's README for why: Athenaeum's deploy key is read-only on
 purpose, and this needed write access, so it gets its own key and its
@@ -9,6 +9,11 @@ Every write is a brand-new, uniquely-named file — never an edit to an
 existing note. That's what keeps a push conflict rare: git only has
 something to reconcile when the same file changed on both sides, and a
 fresh file never collides with whatever you're editing live in Obsidian.
+
+write_note() is the general primitive (any folder, any filename, any
+content — used directly by Hermes's write_vault_note tool for anything
+from a tech plan to a meeting summary). write_finding() is CodebaseSearcher's
+own specific caller, layering repo/topic/date naming on top of it.
 """
 
 import os
@@ -51,34 +56,54 @@ def _slugify(text: str) -> str:
     return slug[:60] or "note"
 
 
-def write_finding(repo: str, question: str | None, markdown_body: str) -> str:
-    """Writes a new note, commits, pushes (one retry via pull --rebase on
-    a rejected push). Returns the note's path relative to the vault root."""
+class InvalidVaultPath(ValueError):
+    pass
+
+
+def _resolve_target(vault_root: Path, folder: str, filename: str) -> Path:
+    """Rejects anything that would escape the vault clone — write_note's
+    folder/filename ultimately come from an LLM tool call, not a trusted
+    caller, so this can't just trust them to stay put."""
+    if not filename or "/" in filename or "\\" in filename or filename in (".", ".."):
+        raise InvalidVaultPath(f"Invalid filename: {filename!r}")
+    if ".." in Path(folder).parts:
+        raise InvalidVaultPath(f"Invalid folder: {folder!r}")
+
+    target = (vault_root / folder / filename).resolve()
+    vault_root_resolved = vault_root.resolve()
+    if vault_root_resolved not in target.parents:
+        raise InvalidVaultPath(f"Resolved path {target} escapes the vault root")
+    return target
+
+
+def write_note(folder: str, filename: str, content: str, commit_summary: str) -> str:
+    """The general primitive: write `content` to `folder/filename` in the
+    vault, commit, push (one retry via pull --rebase on a rejected push).
+    Auto-suffixes on a same-name collision rather than overwriting — see
+    module docstring. Returns the note's path relative to the vault root."""
     path = _ensure_clone()
     _pull(path)
 
-    # A folder per repo, not one flat pile — findings for the same repo
-    # stay together as you research it over multiple sessions.
-    repo_folder_name = _slugify(repo)
-    folder = path / VAULT_FINDINGS_FOLDER / repo_folder_name
-    folder.mkdir(parents=True, exist_ok=True)
+    target = _resolve_target(path, folder, filename)
+    target.parent.mkdir(parents=True, exist_ok=True)
 
-    topic = _slugify(question) if question else "overview"
-    filename = f"{topic}-{date.today().isoformat()}.md"
-    # A second research call on the same repo/topic/day appends a suffix
-    # rather than silently overwriting the earlier note — both stay.
-    n = 2
-    while (folder / filename).exists():
-        filename = f"{topic}-{date.today().isoformat()}-{n}.md"
-        n += 1
+    if target.exists():
+        stem, suffix = target.stem, target.suffix
+        n = 2
+        while target.exists():
+            target = target.with_name(f"{stem}-{n}{suffix}")
+            n += 1
 
-    file_path = folder / filename
-    file_path.write_text(markdown_body)
+    target.write_text(content)
 
-    rel_path = str(Path(VAULT_FINDINGS_FOLDER) / repo_folder_name / filename)
+    # path.resolve(), not path — target is already resolved (symlinks
+    # followed), and on macOS /tmp -> /private/tmp makes the unresolved
+    # and resolved forms mismatch for relative_to() (confirmed by a local
+    # test against a real bare-repo vault before this was added).
+    rel_path = str(target.relative_to(path.resolve()))
     subprocess.run(["git", "-C", str(path), "add", rel_path], check=True, capture_output=True)
     subprocess.run(
-        ["git", "-C", str(path), "commit", "-m", f"Codebase findings: {repo} — {topic}"],
+        ["git", "-C", str(path), "commit", "-m", commit_summary],
         check=True, capture_output=True,
     )
 
@@ -91,6 +116,16 @@ def write_finding(repo: str, question: str | None, markdown_body: str) -> str:
         subprocess.run(["git", "-C", str(path), "pull", "--rebase"], env=_ssh_env(), check=True, capture_output=True)
         retry = _push(path)
         if retry.returncode != 0:
-            raise RuntimeError(f"Failed to push findings note after retry: {retry.stderr}")
+            raise RuntimeError(f"Failed to push note after retry: {retry.stderr}")
 
     return rel_path
+
+
+def write_finding(repo: str, question: str | None, markdown_body: str) -> str:
+    """Writes a codebase-research finding — a folder per repo, filename
+    from the question/topic and date."""
+    repo_folder_name = _slugify(repo)
+    topic = _slugify(question) if question else "overview"
+    filename = f"{topic}-{date.today().isoformat()}.md"
+    folder = f"{VAULT_FINDINGS_FOLDER}/{repo_folder_name}"
+    return write_note(folder, filename, markdown_body, commit_summary=f"Codebase findings: {repo} — {topic}")

@@ -26,6 +26,12 @@ class ForgetRequest(BaseModel):
     repo: str
 
 
+class WriteNoteRequest(BaseModel):
+    folder: str
+    filename: str
+    content: str
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -111,6 +117,33 @@ def research(request: ResearchRequest):
         "is_overview": is_overview,
         "note_path": note_path,
     }
+
+
+@app.post("/write_note")
+def write_note(request: WriteNoteRequest):
+    # General-purpose: unlike /research's findings notes, this takes
+    # whatever folder/filename/content Hermes's own chat model decides on
+    # — e.g. saving a tech plan drafted in conversation, not something
+    # this service itself researched. vault_writer validates the path
+    # can't escape the vault clone.
+    folder = request.folder.strip().strip("/")
+    filename = request.filename.strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+    if not request.content.strip():
+        raise HTTPException(status_code=400, detail="content is required")
+
+    try:
+        note_path = vault_writer.write_note(
+            folder, filename, request.content, commit_summary=f"Add note: {folder}/{filename}"
+        )
+    except vault_writer.InvalidVaultPath as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Failed to write note to %s/%s", folder, filename)
+        raise HTTPException(status_code=502, detail=f"Failed to write note: {exc}")
+
+    return {"note_path": note_path}
 
 
 @app.post("/forget")
