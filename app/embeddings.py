@@ -23,11 +23,27 @@ def _resolve_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+# Confirmed live on the homelab GPU: Jina's default max_seq_length is 8192
+# (it's built for long-context code), and a single ~6500-char chunk — well
+# under CHUNK_HARD_MAX_CHARS — tokenized to ~3000+ tokens and needed a
+# 3.43 GiB attention tensor on its own (batch x heads x seq x seq scaling),
+# OOMing a 12GB card even with nothing else resident on it. The char-based
+# chunk cap in chunking.py bounds embedding *quality* (don't blend
+# unrelated code into one vector) but is a poor proxy for the actual
+# memory driver, which is token count. Truncating here is the real
+# safety net: 1024 tokens keeps peak attention memory in the tens of MB
+# regardless of how a chunk tokenizes, at the cost of silently dropping
+# anything past that in a rare oversized chunk.
+MAX_SEQ_LENGTH = 1024
+
+
 @lru_cache(maxsize=1)
 def _model():
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(EMBEDDING_MODEL, trust_remote_code=True, device=_resolve_device())
+    model = SentenceTransformer(EMBEDDING_MODEL, trust_remote_code=True, device=_resolve_device())
+    model.max_seq_length = MAX_SEQ_LENGTH
+    return model
 
 
 def unload_model() -> None:
