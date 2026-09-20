@@ -61,6 +61,11 @@ def research(request: ResearchRequest):
     try:
         path, commit, cache_key = repo_manager.clone_or_pull(repo)
     except Exception as exc:
+        # A bare HTTPException here previously left the actual git error
+        # (auth failure, network blip, bad ref) visible only in the HTTP
+        # response, not in the service's own logs — undiagnosable from
+        # journalctl alone. Log it too.
+        logger.exception("Failed to clone/pull '%s'", repo)
         raise HTTPException(status_code=502, detail=f"Failed to clone/pull '{repo}': {exc}")
 
     if repo_manager.get_indexed_commit(cache_key) != commit:
