@@ -10,6 +10,12 @@ logger = logging.getLogger("codebase-searcher")
 
 app = FastAPI(title="CodebaseSearcher")
 
+# When no question is given, search for this instead of skipping search
+# entirely — a "first look" ask still needs *something* for Hermes's own
+# model to actually read and summarize, not just a bare "indexed" message
+# with zero repo content in it.
+OVERVIEW_QUERY = "what this project does: its main purpose, architecture, and key components"
+
 
 class ResearchRequest(BaseModel):
     repo: str
@@ -43,11 +49,10 @@ def _build_findings_markdown(display_name: str, question: str | None, hits: list
     lines = [f"# Codebase findings: {display_name}", ""]
     if question:
         lines += [f"**Question:** {question}", ""]
+    else:
+        lines += ["General overview — representative snippets, no specific question asked.", ""]
     if not hits:
-        if question:
-            lines += ["No relevant snippets found for this question.", ""]
-        else:
-            lines += ["Indexed for search, but no question was asked this time.", ""]
+        lines += ["No relevant snippets found.", ""]
     else:
         lines += ["## Relevant snippets", ""]
         for hit in hits:
@@ -77,7 +82,9 @@ def research(request: ResearchRequest):
         repo_manager.set_indexed_commit(cache_key, commit)
         logger.info("Re-indexed %s at %s: %d chunks", cache_key, commit[:8], count)
 
-    hits = vector_store.search_repo(cache_key, request.question, top_k=8) if request.question else []
+    is_overview = not request.question
+    search_query = request.question or OVERVIEW_QUERY
+    hits = vector_store.search_repo(cache_key, search_query, top_k=8)
     display_name = _display_name(cache_key)
     markdown = _build_findings_markdown(display_name, request.question, hits)
 
@@ -92,11 +99,18 @@ def research(request: ResearchRequest):
             "repo": display_name,
             "commit": commit,
             "hits": hits,
+            "is_overview": is_overview,
             "note_path": None,
             "note_error": str(exc),
         }
 
-    return {"repo": display_name, "commit": commit, "hits": hits, "note_path": note_path}
+    return {
+        "repo": display_name,
+        "commit": commit,
+        "hits": hits,
+        "is_overview": is_overview,
+        "note_path": note_path,
+    }
 
 
 @app.post("/forget")

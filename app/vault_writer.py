@@ -57,22 +57,25 @@ def write_finding(repo: str, question: str | None, markdown_body: str) -> str:
     path = _ensure_clone()
     _pull(path)
 
-    folder = path / VAULT_FINDINGS_FOLDER
+    # A folder per repo, not one flat pile — findings for the same repo
+    # stay together as you research it over multiple sessions.
+    repo_folder_name = _slugify(repo)
+    folder = path / VAULT_FINDINGS_FOLDER / repo_folder_name
     folder.mkdir(parents=True, exist_ok=True)
 
     topic = _slugify(question) if question else "overview"
-    filename = f"{_slugify(repo)}-{topic}-{date.today().isoformat()}.md"
+    filename = f"{topic}-{date.today().isoformat()}.md"
     # A second research call on the same repo/topic/day appends a suffix
     # rather than silently overwriting the earlier note — both stay.
     n = 2
     while (folder / filename).exists():
-        filename = f"{_slugify(repo)}-{topic}-{date.today().isoformat()}-{n}.md"
+        filename = f"{topic}-{date.today().isoformat()}-{n}.md"
         n += 1
 
     file_path = folder / filename
     file_path.write_text(markdown_body)
 
-    rel_path = str(Path(VAULT_FINDINGS_FOLDER) / filename)
+    rel_path = str(Path(VAULT_FINDINGS_FOLDER) / repo_folder_name / filename)
     subprocess.run(["git", "-C", str(path), "add", rel_path], check=True, capture_output=True)
     subprocess.run(
         ["git", "-C", str(path), "commit", "-m", f"Codebase findings: {repo} — {topic}"],
