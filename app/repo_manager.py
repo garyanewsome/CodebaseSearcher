@@ -78,6 +78,10 @@ def _indexed_commit_file(cache_key: str) -> Path:
     return repo_path(cache_key).parent / f".{cache_key}.indexed_commit"
 
 
+def _overview_note_file(cache_key: str) -> Path:
+    return repo_path(cache_key).parent / f".{cache_key}.overview_note"
+
+
 def clone_or_pull(repo: str) -> tuple[Path, str, str]:
     """Returns (local_path, current_head_commit, cache_key)."""
     clone_url, cache_key = resolve_repo(repo)
@@ -111,6 +115,26 @@ def set_indexed_commit(cache_key: str, commit: str) -> None:
     _indexed_commit_file(cache_key).write_text(commit)
 
 
+def get_overview_note(cache_key: str, commit: str) -> str | None:
+    """Returns the existing general-overview note's vault path for this
+    exact commit, if one was already written — None if the repo changed
+    since, or no overview has been written yet. Guards against a real
+    failure mode: a retry after a stalled/timed-out turn (the model's
+    reply for the first attempt never got far enough to be persisted, so
+    it has no memory it already researched this) re-calls research_repo
+    for the same unchanged repo, and without this, that silently writes a
+    second byte-identical overview note — confirmed live."""
+    f = _overview_note_file(cache_key)
+    if not f.exists():
+        return None
+    stored_commit, _, note_path = f.read_text().partition("\n")
+    return note_path if stored_commit == commit and note_path else None
+
+
+def set_overview_note(cache_key: str, commit: str, note_path: str) -> None:
+    _overview_note_file(cache_key).write_text(f"{commit}\n{note_path}")
+
+
 def delete_repo(repo: str) -> str:
     """Returns the cache_key that was deleted, so the caller can also
     drop the matching vector index."""
@@ -121,4 +145,7 @@ def delete_repo(repo: str) -> str:
     marker = _indexed_commit_file(cache_key)
     if marker.exists():
         marker.unlink()
+    overview_marker = _overview_note_file(cache_key)
+    if overview_marker.exists():
+        overview_marker.unlink()
     return cache_key

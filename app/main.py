@@ -92,6 +92,28 @@ def research(request: ResearchRequest):
     search_query = request.question or OVERVIEW_QUERY
     hits = vector_store.search_repo(cache_key, search_query, top_k=8)
     display_name = _display_name(cache_key)
+
+    # Reuse an existing general-overview note for this exact commit rather
+    # than writing another one — the real failure mode this guards against:
+    # a stalled/timed-out turn leaves nothing persisted for the model to
+    # remember it already looked, so a manual retry (or the model just
+    # deciding to look again) calls /research a second time for the same
+    # unchanged repo. Confirmed live: that produced two byte-identical
+    # "overview" notes a few seconds apart. A real question always gets
+    # its own note, even for a repeat commit — a distinct question is a
+    # distinct ask, not a redundant one.
+    if is_overview:
+        existing = repo_manager.get_overview_note(cache_key, commit)
+        if existing:
+            return {
+                "repo": display_name,
+                "commit": commit,
+                "hits": hits,
+                "is_overview": is_overview,
+                "note_path": existing,
+                "note_reused": True,
+            }
+
     markdown = _build_findings_markdown(display_name, request.question, hits)
 
     try:
@@ -109,6 +131,9 @@ def research(request: ResearchRequest):
             "note_path": None,
             "note_error": str(exc),
         }
+
+    if is_overview:
+        repo_manager.set_overview_note(cache_key, commit, note_path)
 
     return {
         "repo": display_name,
