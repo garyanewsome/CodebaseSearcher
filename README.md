@@ -8,9 +8,8 @@ on-demand, one repo at a time, when you actually want it looked at.
 
 ## What it does
 
-- `POST /research {"repo": "...", "question": "..."}` — clones/pulls the repo (GitHub, same account the homelab already has SSH access to), re-indexes it only if the commit actually changed since last time, semantically searches for `question` (or a generic overview query if omitted), and writes a findings note into the vault. Returns the matched snippets plus the note's path.
+- `POST /research {"repo": "...", "question": "..."}` — clones/pulls the repo (GitHub, same account the homelab already has SSH access to), re-indexes it only if the commit actually changed since last time, semantically searches for `question` (or a generic overview query if omitted), and has [vault-keeper](https://github.com/garyanewsome/vault-keeper) write a findings note into the vault. Returns the matched snippets plus the note's path.
 - `POST /forget {"repo": "..."}` — deletes the repo's local clone and its embedding index. Does **not** touch any findings note already written to the vault — those are yours to keep or delete like any other note; this only cleans up the disposable, regenerable cache.
-- `POST /write_note {"folder": "...", "filename": "...", "content": "..."}` — general-purpose: writes arbitrary content as a new note at any vault path, for anything that isn't codebase research (Hermes's `write_vault_note` tool). See "Writing to the vault" below.
 - `GET /health`
 - `POST /unload` — frees the GPU (see "GPU handoff" below)
 
@@ -38,15 +37,9 @@ A hard 6500-char ceiling (`CHUNK_HARD_MAX_CHARS`) caps every chunk regardless of
 
 ## Writing to the vault
 
-A **separate** git clone and a **separate**, write-scoped-to-only-this-repo GitHub deploy key from Athenaeum's — Athenaeum's own key is deliberately read-only, and this needed write access, so rather than upgrading a key that has no other reason to ever write anything, this gets its own. Least-privilege: if this service is ever compromised or buggy, the blast radius is "can push new files to one repo," not "can read or write anything the account key can touch."
+Not done here. The vault's git clone, its write-scoped deploy key, the write limits and the audit log belong to the **vault-keeper** service (`VAULT_KEEPER_URL`, default `http://192.168.1.157:8310`). `app/vault_writer.py`'s `write_finding()` picks a repo/topic/date folder and filename and POSTs the note to vault-keeper's `/write_note` with `source: codebase-searcher`.
 
-`app/vault_writer.py`'s `write_note(folder, filename, content, commit_summary)` is the general primitive — any folder, any filename, any content, path-traversal-checked (rejects `..` components and anything that resolves outside the vault clone). `write_finding()` (used by `/research`) is just a thin wrapper over it that picks a repo/topic/date folder and filename.
-
-`POST /write_note {"folder": "...", "filename": "...", "content": "..."}` exposes the general primitive directly — this is what Hermes's `write_vault_note` tool calls for arbitrary content (a tech plan drafted in chat, a meeting summary, anything that isn't codebase research). Returns `{"note_path": "..."}`.
-
-Every write is a **brand-new, uniquely-named file** — never an edit to an existing note. On a name collision, a numeric suffix is appended (`-2`, `-3`, ...) rather than overwriting. That's the whole reason a push conflict is rare: git only has something to reconcile when the *same* file changed on both sides, and a fresh file never collides with whatever you're editing live in Obsidian on your own devices. On a rejected push (something else landed on the remote in between pull and push), it does one `pull --rebase` and retries once before giving up.
-
-Verified end to end against a throwaway fake vault (a local bare git repo, never the real one): both `write_finding` and `write_note` land on the "remote," confirmed via an independent fresh clone — not just a local working-directory illusion — and a same-name collision gets a distinct filename rather than silently overwriting the first. Also caught a real bug this way: the path-traversal check's `relative_to()` broke on macOS because `/tmp` symlinks to `/private/tmp`, making the resolved target and the unresolved vault path mismatch — fixed by resolving both sides consistently.
+This service used to own the clone, and Hermes borrowed its `/write_note`, `/read_note` and `/suggest_edit`. Those endpoints moved to vault-keeper, so this service no longer has a vault clone or the vault deploy key. If a findings write fails (vault-keeper down, policy refusal), `/research` still returns the snippets, with `note_error` set.
 
 ## Running it locally
 
@@ -81,14 +74,7 @@ python3.12 -m venv .venv
 mkdir -p /mnt/storage/codebase-searcher-data
 ```
 
-The two GitHub keys just need to already exist at the paths `app/config.py` expects (see there) — the account-level key (`~/.ssh/id_ed25519_github`) almost certainly already does; the vault write-scoped key needs generating once if it doesn't exist yet:
-
-```bash
-mkdir -p ~/.ssh/codebase-searcher
-ssh-keygen -t ed25519 -f ~/.ssh/codebase-searcher/vault_write -N ""
-# add the .pub half as a deploy key on the obsidian-vault repo, with
-# "Allow write access" checked
-```
+The account-level GitHub key (`~/.ssh/id_ed25519_github`) almost certainly already exists. The vault deploy key is vault-keeper's now (see its README); this service no longer needs it.
 
 Then create the systemd unit (`/etc/systemd/system/codebase-searcher.service`), matching Iris's shape:
 
@@ -122,7 +108,7 @@ Two tools in Hermes's `app/tools.py`: `research_repo(repo, question)` and `forge
 ## Status
 
 - [x] Chunking, embedding, indexing, semantic search — verified against a real test repo, including that a discount-pricing question correctly ranked the pricing function far above an unrelated greeting function
-- [x] Vault write-back — verified end to end against a throwaway fake vault, including the push-retry path and same-day dedup naming
+- [x] Vault write-back — moved to vault-keeper (tested there against a throwaway fake vault)
 - [x] Chunk-size OOM fix verified on the real homelab hardware: encoding dragonfly-reverb's 284 chunks held around 1.7GB RSS on CPU — no OOM kill (previously crashed at 12.3GB)
 - [x] Moved to bare-metal/GPU after that same CPU run measured 552.7s (~9 min) for 284 chunks — too slow for a synchronous tool call. GPU handoff code written (`unload_model`/`/unload`, mirroring Iris); **not yet re-benchmarked on the actual RTX 3060** — do that once deployed, before considering this fully verified
 - [ ] Not yet deployed — needs the one-time systemd setup above run on the homelab
