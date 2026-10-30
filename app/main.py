@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from app import embeddings, repo_manager, vault_writer, vector_store
+from app import embeddings, repo_manager, vault_policy, vault_writer, vector_store
 from app.chunking import chunk_repo
 
 logger = logging.getLogger("codebase-searcher")
@@ -30,6 +30,12 @@ class WriteNoteRequest(BaseModel):
     folder: str
     filename: str
     content: str
+
+
+class SuggestEditRequest(BaseModel):
+    path: str  # vault-relative path of the existing note the change is for
+    proposed_content: str  # the full text the note should have after the change
+    reason: str
 
 
 @app.get("/health")
@@ -151,16 +157,20 @@ def write_note(request: WriteNoteRequest):
     # — e.g. saving a tech plan drafted in conversation, not something
     # this service itself researched. vault_writer validates the path
     # can't escape the vault clone.
-    folder = request.folder.strip().strip("/")
-    filename = request.filename.strip()
-    if not filename:
-        raise HTTPException(status_code=400, detail="filename is required")
-    if not request.content.strip():
-        raise HTTPException(status_code=400, detail="content is required")
+    try:
+        folder = vault_policy.check_folder(request.folder)
+        filename = vault_policy.check_filename(request.filename)
+        if not request.content.strip():
+            raise vault_policy.PolicyViolation("content is required")
+        content = vault_policy.stamp(request.content, "note")
+        vault_policy.check_size(content)
+        vault_policy.check_rate()
+    except vault_policy.PolicyViolation as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
     try:
         note_path = vault_writer.write_note(
-            folder, filename, request.content, commit_summary=f"Add note: {folder}/{filename}"
+            folder, filename, content, commit_summary=f"Hermes: add note {folder}/{filename}"
         )
     except vault_writer.InvalidVaultPath as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -168,6 +178,40 @@ def write_note(request: WriteNoteRequest):
         logger.exception("Failed to write note to %s/%s", folder, filename)
         raise HTTPException(status_code=502, detail=f"Failed to write note: {exc}")
 
+    vault_policy.record("note", note_path, len(content.encode("utf-8")))
+    return {"note_path": note_path}
+
+
+@app.post("/suggest_edit")
+def suggest_edit(request: SuggestEditRequest):
+    # Hermes never edits an existing note. It files a suggestion note under
+    # VAULT_SUGGESTIONS_FOLDER holding a unified diff against the current
+    # text plus the full proposed text, and the user decides in Obsidian.
+    try:
+        vault_policy.check_rate()
+        current = vault_writer.read_note(request.path)
+        if current is None:
+            raise vault_policy.PolicyViolation(
+                f"No note at {request.path!r}. To create a new note use write_vault_note."
+            )
+        body = vault_policy.build_suggestion(request.path, current, request.proposed_content, request.reason)
+        body = vault_policy.stamp(body, "suggestion")
+        vault_policy.check_size(body)
+        folder, filename = vault_policy.suggestion_location(request.path)
+    except vault_policy.PolicyViolation as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except vault_writer.InvalidVaultPath as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        note_path = vault_writer.write_note(
+            folder, filename, body, commit_summary=f"Hermes: suggest edit to {request.path}"
+        )
+    except Exception as exc:
+        logger.exception("Failed to write suggestion for %s", request.path)
+        raise HTTPException(status_code=502, detail=f"Failed to write suggestion: {exc}")
+
+    vault_policy.record("suggestion", note_path, len(body.encode("utf-8")), reason=request.reason)
     return {"note_path": note_path}
 
 

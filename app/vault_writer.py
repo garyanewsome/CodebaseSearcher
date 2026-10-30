@@ -121,6 +121,16 @@ def write_note(folder: str, filename: str, content: str, commit_summary: str) ->
     return rel_path
 
 
+def read_note(rel_path: str) -> str | None:
+    """Current text of an existing vault note, or None if there is no such
+    file. Same escape check as writes: the path comes from a tool call."""
+    path = _ensure_clone()
+    _pull(path)
+    folder, _, filename = rel_path.strip().strip("/").rpartition("/")
+    target = _resolve_target(path, folder, filename)
+    return target.read_text() if target.is_file() else None
+
+
 def write_finding(repo: str, question: str | None, markdown_body: str) -> str:
     """Writes a codebase-research finding — a folder per repo, filename
     from the question/topic and date."""

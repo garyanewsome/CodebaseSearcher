@@ -24,3 +24,12 @@ VAULT_REPO_URL = os.environ.get("VAULT_REPO_URL", "git@github.com:garyanewsome/o
 # something as personal as the vault.
 VAULT_SSH_KEY_PATH = os.environ.get("VAULT_SSH_KEY_PATH", "/home/garyanewsome/.ssh/codebase-searcher/vault_write")
 VAULT_FINDINGS_FOLDER = os.environ.get("VAULT_FINDINGS_FOLDER", "10 Development/Codebase Findings")
+
+# Limits on what Hermes's chat model may write (see app/vault_policy.py).
+# Notes may be created anywhere in the vault except dot-folders and dot-files
+# (.git, .obsidian: both can run code). Set VAULT_WRITE_ROOTS to a
+# comma-separated list of folders to confine writes to just those.
+VAULT_WRITE_ROOTS = [r.strip().strip("/") for r in os.environ.get("VAULT_WRITE_ROOTS", "").split(",") if r.strip()]
+VAULT_SUGGESTIONS_FOLDER = os.environ.get("VAULT_SUGGESTIONS_FOLDER", "Hermes/Suggestions")
+VAULT_MAX_NOTE_BYTES = int(os.environ.get("VAULT_MAX_NOTE_BYTES", "65536"))
+VAULT_MAX_WRITES_PER_DAY = int(os.environ.get("VAULT_MAX_WRITES_PER_DAY", "100"))
