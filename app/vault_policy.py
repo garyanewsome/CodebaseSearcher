@@ -59,6 +59,17 @@ def check_folder(folder: str) -> str:
     )
 
 
+def check_readable(path: str) -> str:
+    """Reads get the same dot-path rule as writes (no .git, no .obsidian),
+    but no folder scope: the whole vault is readable."""
+    parts = [p for p in PurePosixPath(path.strip().strip("/")).parts if p not in ("", ".")]
+    if not parts or any(p.startswith(".") for p in parts):
+        raise PolicyViolation(f"Hidden paths can't be read: {path!r}")
+    if PurePosixPath(parts[-1]).suffix.lower() != ".md":
+        raise PolicyViolation(f"Only .md notes can be read, not {path!r}")
+    return "/".join(parts)
+
+
 def check_filename(filename: str) -> str:
     """Notes are markdown. No extension means .md; any other extension is refused."""
     filename = filename.strip()

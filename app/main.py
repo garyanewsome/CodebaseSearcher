@@ -32,6 +32,10 @@ class WriteNoteRequest(BaseModel):
     content: str
 
 
+class ReadNoteRequest(BaseModel):
+    path: str  # vault-relative path of a .md note
+
+
 class SuggestEditRequest(BaseModel):
     path: str  # vault-relative path of the existing note the change is for
     proposed_content: str  # the full text the note should have after the change
@@ -180,6 +184,29 @@ def write_note(request: WriteNoteRequest):
 
     vault_policy.record("note", note_path, len(content.encode("utf-8")))
     return {"note_path": note_path}
+
+
+@app.post("/read_note")
+def read_note(request: ReadNoteRequest):
+    # The whole text of one note, so an edit can be proposed against what is
+    # really there rather than a search snippet. Capped at the write limit:
+    # anything bigger could not be sent back as a suggestion anyway.
+    try:
+        path = vault_policy.check_readable(request.path)
+        content = vault_writer.read_note(path)
+    except vault_policy.PolicyViolation as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except vault_writer.InvalidVaultPath as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if content is None:
+        raise HTTPException(status_code=404, detail=f"No note at {path!r}")
+    size = len(content.encode("utf-8"))
+    if size > vault_policy.VAULT_MAX_NOTE_BYTES:
+        raise HTTPException(
+            status_code=403,
+            detail=f"{path!r} is {size} bytes, over the {vault_policy.VAULT_MAX_NOTE_BYTES}-byte limit for notes Hermes works on",
+        )
+    return {"path": path, "content": content}
 
 
 @app.post("/suggest_edit")
