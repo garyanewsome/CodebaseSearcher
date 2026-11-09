@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from app import embeddings, repo_manager, vault_writer, vector_store
+from app import embeddings, jobs, repo_manager, vault_writer, vector_store
 from app.chunking import chunk_repo
 
 logger = logging.getLogger("codebase-searcher")
@@ -60,32 +60,58 @@ def _build_findings_markdown(display_name: str, question: str | None, hits: list
     return "\n".join(lines)
 
 
-@app.post("/research")
-def research(request: ResearchRequest):
-    repo = request.repo.strip()
+def _noop_progress(stage, detail=None, done=None, total=None):
+    pass
+
+
+def _do_research(repo: str, question: str | None, progress=_noop_progress) -> dict:
+    """The whole research flow. `progress(stage, detail, done, total)` reports
+    where it is (see jobs.py); a plain /research call passes a no-op."""
+    repo = repo.strip()
     if not repo:
         raise HTTPException(status_code=400, detail="repo is required")
 
     try:
-        path, commit, cache_key = repo_manager.clone_or_pull(repo)
+        _, cache_key = repo_manager.resolve_repo(repo)
     except Exception as exc:
-        # A bare HTTPException here previously left the actual git error
-        # (auth failure, network blip, bad ref) visible only in the HTTP
-        # response, not in the service's own logs — undiagnosable from
-        # journalctl alone. Log it too.
-        logger.exception("Failed to clone/pull '%s'", repo)
+        logger.exception("Couldn't resolve '%s'", repo)
         raise HTTPException(status_code=502, detail=f"Failed to clone/pull '{repo}': {exc}")
-
-    if repo_manager.get_indexed_commit(cache_key) != commit:
-        chunks = chunk_repo(path)
-        count = vector_store.replace_repo_index(cache_key, chunks)
-        repo_manager.set_indexed_commit(cache_key, commit)
-        logger.info("Re-indexed %s at %s: %d chunks", cache_key, commit[:8], count)
-
-    is_overview = not request.question
-    search_query = request.question or OVERVIEW_QUERY
-    hits = vector_store.search_repo(cache_key, search_query, top_k=8)
     display_name = _display_name(cache_key)
+
+    # Held while the repo is fetched and indexed, so a retry or a second
+    # question about a repo that is mid-index waits for that run and then
+    # finds it indexed, instead of deleting and rebuilding the same index
+    # underneath it.
+    lock = repo_manager.repo_lock(cache_key)
+    if lock.locked():
+        progress("waiting", f"Waiting for another analysis of {display_name} to finish…")
+    with lock:
+        progress("cloning", f"Fetching {display_name}…")
+        try:
+            path, commit, cache_key = repo_manager.clone_or_pull(repo)
+        except Exception as exc:
+            # A bare HTTPException here previously left the actual git error
+            # (auth failure, network blip, bad ref) visible only in the HTTP
+            # response, not in the service's own logs — undiagnosable from
+            # journalctl alone. Log it too.
+            logger.exception("Failed to clone/pull '%s'", repo)
+            raise HTTPException(status_code=502, detail=f"Failed to clone/pull '{repo}': {exc}")
+
+        if repo_manager.get_indexed_commit(cache_key) != commit:
+            progress("chunking", f"Reading {display_name}'s source files…")
+            chunks = chunk_repo(path)
+            logger.info("Indexing %s at %s: %d chunks", cache_key, commit[:8], len(chunks))
+            progress("embedding", f"Indexing {display_name}: embedding", 0, len(chunks))
+            count = vector_store.replace_repo_index(
+                cache_key, chunks, progress=lambda done, total: progress("embedding", None, done, total)
+            )
+            repo_manager.set_indexed_commit(cache_key, commit)
+            logger.info("Re-indexed %s at %s: %d chunks", cache_key, commit[:8], count)
+
+    is_overview = not question
+    search_query = question or OVERVIEW_QUERY
+    progress("searching", f"Searching {display_name} for relevant code…")
+    hits = vector_store.search_repo(cache_key, search_query, top_k=8)
 
     # Reuse an existing general-overview note for this exact commit rather
     # than writing another one — the real failure mode this guards against:
@@ -108,10 +134,11 @@ def research(request: ResearchRequest):
                 "note_reused": True,
             }
 
-    markdown = _build_findings_markdown(display_name, request.question, hits)
+    markdown = _build_findings_markdown(display_name, question, hits)
 
+    progress("writing", "Writing the findings note to the vault…")
     try:
-        note_path = vault_writer.write_finding(display_name, request.question, markdown)
+        note_path = vault_writer.write_finding(display_name, question, markdown)
     except Exception as exc:
         # The search itself succeeded even if the vault write failed —
         # still worth returning the snippets rather than a bare 500 for a
@@ -136,6 +163,36 @@ def research(request: ResearchRequest):
         "is_overview": is_overview,
         "note_path": note_path,
     }
+
+
+@app.post("/research")
+def research(request: ResearchRequest):
+    """Blocking version: returns when the whole thing is done. Fine for a
+    small repo; for a big one use /research/start, which doesn't hold a
+    request open for tens of minutes."""
+    return _do_research(request.repo, request.question)
+
+
+@app.post("/research/start")
+def research_start(request: ResearchRequest):
+    """Starts the research in the background (or joins one already running for
+    the same repo and question) and returns a job to poll."""
+    if not request.repo.strip():
+        raise HTTPException(status_code=400, detail="repo is required")
+    job = jobs.start(
+        request.repo,
+        request.question,
+        lambda progress: _do_research(request.repo, request.question, progress),
+    )
+    return job.snapshot()
+
+
+@app.get("/research/jobs/{job_id}")
+def research_job(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="No such job (the service may have restarted); start it again")
+    return job.snapshot()
 
 
 @app.post("/forget")

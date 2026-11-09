@@ -30,31 +30,62 @@ def _collection_name(repo: str) -> str:
     return f"repo-{safe or 'unnamed'}"
 
 
-def replace_repo_index(repo: str, chunks: list[dict]) -> int:
-    """Drops and rebuilds this repo's collection from scratch — simpler
-    and safer than diffing which chunks changed, and cheap enough given
-    this only runs when the repo's commit hash actually moved."""
-    client = _get_client()
-    name = _collection_name(repo)
+# Texts embedded (and stored) per step. Small enough that progress moves
+# every few seconds and a crash loses little, big enough to keep the GPU busy.
+EMBED_SLICE = 128
+
+
+def _drop(client, name: str) -> None:
     try:
         client.delete_collection(name)
     except Exception:
         pass
+
+
+def replace_repo_index(repo: str, chunks: list[dict], progress=None) -> int:
+    """Rebuilds this repo's collection from scratch, only ever touching its
+    own data.
+
+    The new index is built under a temporary name, slice by slice, and only
+    swapped in once complete. Two things that went wrong before: Chroma
+    refuses a single add() larger than its max batch size (5,461 here), so a
+    repo with more chunks than that embedded for 20+ minutes and then failed
+    at the very last step; and the old index was dropped before the new one
+    existed, so a failure left the repo with no index at all.
+
+    `progress(done, total)` is called after every slice."""
+    client = _get_client()
+    name = _collection_name(repo)
+    building = f"{name}-building"
+    _drop(client, building)  # a leftover from a run that was killed midway
+
+    total = len(chunks)
     if not chunks:
+        _drop(client, name)
         return 0
 
-    collection = client.create_collection(name)
-    contents = [c["content"] for c in chunks]
-    embeddings = encode_texts(contents)
-    ids = [f"{repo}::{i}" for i in range(len(chunks))]
-    metadatas = [{"file_path": c["file_path"]} for c in chunks]
-    collection.add(
-        ids=ids,
-        embeddings=embeddings.tolist(),
-        documents=contents,
-        metadatas=metadatas,
-    )
-    return len(chunks)
+    collection = client.create_collection(building)
+    step = max(1, min(EMBED_SLICE, client.get_max_batch_size()))
+    try:
+        for start in range(0, total, step):
+            part = chunks[start : start + step]
+            contents = [c["content"] for c in part]
+            embeddings = encode_texts(contents, show_progress_bar=False)
+            collection.add(
+                ids=[f"{repo}::{start + i}" for i in range(len(part))],
+                embeddings=embeddings.tolist(),
+                documents=contents,
+                metadatas=[{"file_path": c["file_path"]} for c in part],
+            )
+            if progress:
+                progress(start + len(part), total)
+    except Exception:
+        _drop(client, building)
+        raise
+
+    _drop(client, name)
+    collection.modify(name=name)
+    return total
 
 
 def search_repo(repo: str, query: str, top_k: int = 8) -> list[dict]:

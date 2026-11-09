@@ -65,14 +65,17 @@ def embedding_dim() -> int:
     return int(_model().get_sentence_embedding_dimension())
 
 
-def encode_texts(texts: Sequence[str], batch_size: int = 8) -> np.ndarray:
+def encode_texts(texts: Sequence[str], batch_size: int = 8, show_progress_bar: bool | None = None) -> np.ndarray:
     if not texts:
         return np.zeros((0, embedding_dim()), dtype=np.float32)
     model = _model()
     emb = model.encode(
         list(texts),
         batch_size=batch_size,
-        show_progress_bar=len(texts) > 20,
+        # The terminal bar is only useful for a one-off big call; indexing
+        # encodes in small slices and reports its own progress instead (a
+        # bar per slice would just spam the journal).
+        show_progress_bar=(len(texts) > 20) if show_progress_bar is None else show_progress_bar,
         normalize_embeddings=True,
         convert_to_numpy=True,
     )

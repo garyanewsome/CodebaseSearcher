@@ -17,6 +17,7 @@ git error instead of a confusing auth failure against the wrong owner.
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 from app.config import DATA_DIR, GITHUB_SSH_KEY_PATH, GITHUB_USER
@@ -62,6 +63,19 @@ def resolve_repo(repo: str) -> tuple[str, str]:
         clone_url = f"https://github.com/{owner}/{name}.git"
         cache_key = f"{owner}__{name}"
     return clone_url, cache_key
+
+
+_repo_locks: dict[str, threading.Lock] = {}
+_repo_locks_guard = threading.Lock()
+
+
+def repo_lock(cache_key: str) -> threading.Lock:
+    """One lock per repo, held while it is being fetched and indexed. A retry
+    (or a second question) about a repo that is already being indexed waits
+    for that run and then finds it indexed, instead of starting a second
+    index that deletes and rebuilds the first one's."""
+    with _repo_locks_guard:
+        return _repo_locks.setdefault(cache_key, threading.Lock())
 
 
 def repos_dir() -> Path:
